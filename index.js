@@ -21,27 +21,81 @@ const KANBANCW_HEADERS = {
     'content-type': 'application/json'
 };
 
+// Regras de detecção para o Funil de Crediário (por padrão de texto)
+const CREDIARIO_RULES = [
+    {
+        pattern: /\[STATUS: success\]/i,
+        stageId: process.env.KANBANCW_STAGE_ANALISE_ID,
+        label: 'analise-credito',
+        nome: 'Análise de Crédito'
+    },
+    {
+        pattern: /fatura de energia el[eé]trica/i,
+        stageId: process.env.KANBANCW_STAGE_PROPOSTA_ID,
+        label: 'proposta-enviada',
+        nome: 'Proposta Enviada'
+    },
+    {
+        pattern: /an[aá]lise de cr[eé]dito realizada|sistema n[aã]o liberou ofertas/i,
+        stageId: process.env.KANBANCW_STAGE_REPROVADO_ID,
+        label: 'reprovado',
+        nome: 'Reprovado'
+    }
+];
+
+// Função auxiliar para mover card e adicionar label
+async function moverCard(conversationId, accountId, stageId, label, nome) {
+    await axios.patch(
+        `${KANBANCW_URL}/api/kanban/${conversationId}/move`,
+        { targetColumn: stageId },
+        { headers: KANBANCW_HEADERS }
+    );
+    await axios.post(
+        `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/labels`,
+        { labels: [label] },
+        { headers: { 'api_access_token': CHATWOOT_TOKEN } }
+    );
+    console.log(`[CREDIÁRIO] Conversa ${conversationId} → ${nome} (label: ${label})`);
+}
+
 app.post('/webhook/chatwoot', async (req, res) => {
     try {
         const payload = req.body;
 
-        // 1. Filtrar o gatilho. Ex: Só executar quando o status da conversa for atualizado para 'resolved' ou 'snoozed'
-        if (payload.event !== 'conversation_status_changed' && !['resolved', 'snoozed'].includes(payload.status)) {
+        // ─── FUNIL DE CREDIÁRIO: detecção por padrão de texto em message_created ───
+        if (payload.event === 'message_created' && payload.content) {
+            const content = payload.content;
+            const accountId = payload.account?.id || process.env.CHATWOOT_ACCOUNT_ID;
+            const conversationId = payload.conversation?.id;
+
+            if (!conversationId) return res.status(200).send('Ignorado: sem conversation_id.');
+
+            for (const regra of CREDIARIO_RULES) {
+                if (regra.pattern.test(content)) {
+                    await moverCard(conversationId, accountId, regra.stageId, regra.label, regra.nome);
+                    return res.status(200).send({ success: true, funil: 'crediario', stage: regra.nome });
+                }
+            }
+
+            return res.status(200).send('Ignorado: mensagem não corresponde a nenhuma regra do crediário.');
+        }
+
+        // ─── FUNIL DE VENDAS: classificação com IA em conversation_status_changed ───
+        if (payload.event !== 'conversation_status_changed' || !['resolved', 'snoozed'].includes(payload.status)) {
             return res.status(200).send('Ignorado: evento não relevante para qualificação.');
         }
 
         const accountId = payload.account?.id || process.env.CHATWOOT_ACCOUNT_ID;
         const conversationId = payload.id || payload.conversation_id;
 
-        // 2. Buscar o Histórico da Conversa no Chatwoot
+        // Buscar o Histórico da Conversa no Chatwoot
         const historyResponse = await axios.get(
             `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`,
             { headers: { 'api_access_token': CHATWOOT_TOKEN } }
         );
 
         const messages = historyResponse.data.payload || [];
-        
-        // Filtrar apenas mensagens com texto e formatar como um chat amigável para a IA
+
         const historyText = messages
             .filter(m => m.content)
             .map(m => `${m.sender_type === 'Contact' ? 'Cliente' : 'Atendente'}: ${m.content}`)
@@ -49,7 +103,7 @@ app.post('/webhook/chatwoot', async (req, res) => {
 
         if (!historyText) return res.status(200).send('Sem histórico válido.');
 
-        // 3. Classificar o lead via AI Agent
+        // Classificar o lead via AI Agent
         const promptSystem = `Você é um especialista em funil de vendas de colchões e produtos de sono.
 Analise o histórico de conversa abaixo e classifique em qual etapa do funil de vendas este lead se encontra.
 
@@ -91,9 +145,6 @@ fundo`;
 
         const stage = completion.choices[0].message.content.trim().toLowerCase();
 
-        // 4. Mover o lead no Funil KanbanCW
-
-        // Mapeamento dos stages do Funil (você precisa pegar esses IDs na API /funnels ou na interface do KanbanCW)
         const stageIds = {
             'topo': process.env.KANBANCW_STAGE_TOPO_ID,
             'meio': process.env.KANBANCW_STAGE_MEIO_ID,
@@ -101,7 +152,6 @@ fundo`;
         };
         const selectedStageId = stageIds[stage] || stageIds['topo'];
 
-        // Chamada para a API do KanbanCW
         if (selectedStageId) {
             await axios.patch(
                 `${KANBANCW_URL}/api/kanban/${conversationId}/move`,
@@ -113,12 +163,12 @@ fundo`;
                 { labels: [stage] },
                 { headers: { 'api_access_token': CHATWOOT_TOKEN } }
             );
-            console.log(`[SUCESSO] Conversa ${conversationId} classificada como ${stage} e movida para o stage ${selectedStageId}`);
+            console.log(`[VENDAS] Conversa ${conversationId} classificada como ${stage} → stage ${selectedStageId}`);
         } else {
             console.log(`[AVISO] Conversa ${conversationId} classificada como ${stage}, mas o ID do Stage não foi configurado no .env.`);
         }
 
-        res.status(200).send({ success: true, classification: stage });
+        res.status(200).send({ success: true, funil: 'vendas', classification: stage });
 
     } catch (error) {
         console.error('[ERRO]', error.response?.data || error.message);
