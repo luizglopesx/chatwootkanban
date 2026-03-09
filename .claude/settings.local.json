@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ssh -o StrictHostKeyChecking=no root@72.61.58.5 \"\nmkdir -p /root/kanban-webhook && \nnode --version && npm --version && pm2 --version\")",
+      "Bash(ssh -o StrictHostKeyChecking=no root@72.61.58.5 \"\ncd /root/kanban-webhook &&\nnpm install &&\npm2 start index.js --name kanban-webhook &&\npm2 save &&\npm2 status\")"
+    ]
+  }
+}
