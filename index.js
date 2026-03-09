@@ -21,31 +21,21 @@ const KANBANCW_HEADERS = {
     'content-type': 'application/json'
 };
 
-// Regras de detecção para o Funil de Crediário (por padrão de texto)
-const CREDIARIO_RULES = [
-    {
-        pattern: /\[STATUS: success\]/i,
-        stageId: process.env.KANBANCW_STAGE_ANALISE_ID,
-        label: 'analise-credito',
-        nome: 'Análise de Crédito'
-    },
-    {
-        pattern: /fatura de energia el[eé]trica/i,
-        stageId: process.env.KANBANCW_STAGE_PROPOSTA_ID,
-        label: 'proposta-enviada',
-        nome: 'Proposta Enviada'
-    },
-    {
-        pattern: /an[aá]lise de cr[eé]dito realizada|sistema n[aã]o liberou ofertas/i,
-        stageId: process.env.KANBANCW_STAGE_REPROVADO_ID,
-        label: 'reprovado',
-        nome: 'Reprovado'
-    }
-];
+// A IA agora fará o papel de identificar se é vendas ou crediário com base no contexto.
+// Função auxiliar para reabrir a conversa no Chatwoot
 
-// Verifica se alguma mensagem do histórico bate com os padrões do crediário
-function isCrediarioConversation(messages) {
-    return messages.some(m => m.content && CREDIARIO_RULES.some(r => r.pattern.test(m.content)));
+// Função auxiliar para reabrir a conversa no Chatwoot
+async function reopenConversation(conversationId, accountId) {
+    try {
+        await axios.post(
+            `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/toggle_status`,
+            { status: 'open' },
+            { headers: { 'api_access_token': CHATWOOT_TOKEN } }
+        );
+        console.log(`[REABERTURA] Conversa ${conversationId} foi REABERTA no Chatwoot com sucesso!`);
+    } catch (error) {
+        console.error(`[ERRO REABERTURA] Falha ao reabrir a conversa ${conversationId}:`, error.response?.data || error.message);
+    }
 }
 
 // Função auxiliar para mover card e adicionar label
@@ -61,29 +51,17 @@ async function moverCard(conversationId, accountId, stageId, label, nome) {
         { headers: { 'api_access_token': CHATWOOT_TOKEN } }
     );
     console.log(`[CREDIÁRIO] Conversa ${conversationId} → ${nome} (label: ${label})`);
+    
+    // Reabrir o card logo em seguida para voltar a aparecer no kanban
+    await reopenConversation(conversationId, accountId);
 }
 
 app.post('/webhook/chatwoot', async (req, res) => {
     try {
         const payload = req.body;
 
-        // ─── FUNIL DE CREDIÁRIO: detecção por padrão de texto em message_created ───
-        if (payload.event === 'message_created' && payload.content) {
-            const content = payload.content;
-            const accountId = payload.account?.id || process.env.CHATWOOT_ACCOUNT_ID;
-            const conversationId = payload.conversation?.id;
-
-            if (!conversationId) return res.status(200).send('Ignorado: sem conversation_id.');
-
-            for (const regra of CREDIARIO_RULES) {
-                if (regra.pattern.test(content)) {
-                    await moverCard(conversationId, accountId, regra.stageId, regra.label, regra.nome);
-                    return res.status(200).send({ success: true, funil: 'crediario', stage: regra.nome });
-                }
-            }
-
-            return res.status(200).send('Ignorado: mensagem não corresponde a nenhuma regra do crediário.');
-        }
+        // Funcionalidade de Regex no message_created foi removida, 
+        // a triagem será feita via IA no status "resolved".
 
         // ─── FUNIL DE VENDAS / CREDIÁRIO via IA: conversation_status_changed ───
         if (payload.event !== 'conversation_status_changed' || !['resolved', 'snoozed'].includes(payload.status)) {
@@ -108,89 +86,44 @@ app.post('/webhook/chatwoot', async (req, res) => {
 
         if (!historyText) return res.status(200).send('Sem histórico válido.');
 
-        // ─── Detecta se é conversa de Crediário ───
-        if (isCrediarioConversation(messages)) {
-            console.log(`[CREDIÁRIO IA] Conversa ${conversationId} identificada como crediário. Classificando...`);
+        // ─── EVITAR RE-AVALIAÇÃO DE CONVERSAS QUE JÁ FORAM CLASSIFICADAS OU ESTÃO PERDIDAS/REPROVADOS ───
+        const existingLabels = payload.conversation?.labels || payload.labels || [];
+        const hasBeenClassified = existingLabels.some(lbl => 
+            ['analise-credito', 'proposta-enviada', 'reprovado', 'topo', 'meio', 'fundo', 'perdido'].includes(lbl)
+        );
 
-            const promptCrediario = `Você é um especialista em análise de crédito e vendas de colchões no crediário.
-Analise o histórico de conversa abaixo e classifique em qual etapa do funil de crediário este lead se encontra.
-
-## Definição das Etapas:
-**ANALISE** — Lead em processo de análise de crédito:
-- Enviou dados pessoais para análise
-- Está aguardando resultado da consulta de crédito
-- O sistema retornou [STATUS: success] (análise iniciada com sucesso)
-
-**PROPOSTA** — Lead com crédito em avaliação ou proposta gerada:
-- Foi solicitada fatura de energia elétrica
-- Recebeu uma proposta de financiamento
-- Está considerando as condições do crediário
-
-**REPROVADO** — Lead com crédito negado:
-- A análise de crédito foi realizada e não liberou ofertas
-- O sistema não aprovou o financiamento
-
-## Instrução:
-Retorne APENAS uma das palavras abaixo, sem explicação, sem pontuação extra:
-analise
-proposta
-reprovado`;
-
-            const completion = await openai.chat.completions.create({
-                model: "gpt-4o-mini",
-                messages: [
-                    { role: "system", content: promptCrediario },
-                    { role: "user", content: `Histórico:\n${historyText}` }
-                ],
-                temperature: 0.1
-            });
-
-            const stage = completion.choices[0].message.content.trim().toLowerCase();
-
-            const stageMap = {
-                'analise': { id: process.env.KANBANCW_STAGE_ANALISE_ID, label: 'analise-credito', nome: 'Análise de Crédito' },
-                'proposta': { id: process.env.KANBANCW_STAGE_PROPOSTA_ID, label: 'proposta-enviada', nome: 'Proposta Enviada' },
-                'reprovado': { id: process.env.KANBANCW_STAGE_REPROVADO_ID, label: 'reprovado', nome: 'Reprovado' }
-            };
-
-            const selected = stageMap[stage] || stageMap['analise'];
-
-            await moverCard(conversationId, accountId, selected.id, selected.label, selected.nome);
-            return res.status(200).send({ success: true, funil: 'crediario-ia', classification: stage });
+        if (hasBeenClassified) {
+            console.log(`[IGNORADO] Conversa ${conversationId} resolvida novamente, porém já classificada/encerrada (${existingLabels.join(', ')}).`);
+            return res.status(200).send('Ignorado: conversa já havia sido classificada ou possui label de finalização.');
         }
 
-        // ─── FUNIL DE VENDAS: classificação com IA ───
-        console.log(`[VENDAS] Conversa ${conversationId} classificando com IA...`);
+        // ─── TRIAGEM UNIVERSAL: Vendas ou Crediário? ───
+        console.log(`[IA TRIAGEM] Conversa ${conversationId} - Analisando se é Vendas ou Crediário...`);
 
-        const promptSystem = `Você é um especialista em funil de vendas de colchões e produtos de sono.
-Analise o histórico de conversa abaixo e classifique em qual etapa do funil de vendas este lead se encontra.
+        const promptSystem = `Você é o classificador mestre da Senhor Colchão.
+Sua missão é ler o histórico e colocar este lead em EXATAMENTE UMA das 6 caixas possíveis.
 
-## Definição das Etapas:
-**TOPO** — Lead recém chegado, ainda descobrindo o problema ou solução:
-- Fez perguntas genéricas ("vocês vendem colchão?", "qual o preço?")
-- Não demonstrou intenção clara de compra
-- Pediu apenas informações básicas
-- Ainda não mencionou modelo, tamanho ou condições
+## Funil de Vendas (Consultor)
+Se o cliente quer comprar, cotar preço, ou o bot diz que vai repassar para os Consultores de Vendas:
+- **topo**: Dúvidas genéricas, sem falar modelo ("qual preço?", "vende colchão?")
+- **meio**: Engajado, escolhendo produto, perguntando de frete, tamanho ("no boleto faz?", "qual a densidade?")
+- **fundo**: Pronto pra comprar, negociando desconto, batendo o martelo final.
 
-**MEIO** — Lead engajado, considerando a compra:
-- Comparou modelos ou marcas
-- Perguntou sobre formas de pagamento, parcelamento ou frete
-- Pediu mais detalhes técnicos (densidade, espuma, molas)
-- Demonstrou interesse em um produto específico
-- Perguntou sobre prazo de entrega ou disponibilidade
-
-**FUNDO** — Lead pronto para comprar ou em decisão final:
-- Perguntou sobre desconto ou negociação de preço
-- Pediu confirmação de estoque
-- Mencionou data ou urgência de compra
-- Está comparando apenas condições finais (frete, prazo, garantia)
-- Disse que vai pensar mas já escolheu o produto
+## Funil de Crediário (Crefaz/Energia)
+Se na conversa eles falam de "parcelamento na conta de luz", "simulação de limite", pedem documentos:
+- **analise-credito**: Estão pedindo dados ou falaram de simulação / análise de crédito, ou o sistema deu [STATUS: success]
+- **proposta-enviada**: Pediram a fatura de luz / aprovaram o crédito e mandaram proposta
+- **reprovado**: Análise de crédito reprovou / não liberou ofertas
 
 ## Instrução:
-Retorne APENAS uma das palavras abaixo, sem explicação, sem pontuação extra:
+Lembre-se: O cliente que perguntou de boleto e recebeu negativa mas começou a ver crediário entra na caixinha do crediário. 
+Responda APENAS com UMA destas palavras EXATAS:
 topo
 meio
-fundo`;
+fundo
+analise-credito
+proposta-enviada
+reprovado`;
 
         const completion = await openai.chat.completions.create({
             model: "gpt-4o-mini",
@@ -203,27 +136,22 @@ fundo`;
 
         const stage = completion.choices[0].message.content.trim().toLowerCase();
 
+        // Mapeamento dos IDs baseados na resposta
         const stageIds = {
-            'topo': process.env.KANBANCW_STAGE_TOPO_ID,
-            'meio': process.env.KANBANCW_STAGE_MEIO_ID,
-            'fundo': process.env.KANBANCW_STAGE_FUNDO_ID
+            'topo':             { id: process.env.KANBANCW_STAGE_TOPO_ID,      nome: 'Topo (Vendas)' },
+            'meio':             { id: process.env.KANBANCW_STAGE_MEIO_ID,      nome: 'Meio (Vendas)' },
+            'fundo':            { id: process.env.KANBANCW_STAGE_FUNDO_ID,     nome: 'Fundo (Vendas)' },
+            'analise-credito':  { id: process.env.KANBANCW_STAGE_ANALISE_ID,   nome: 'Análise (Crediário)' },
+            'proposta-enviada': { id: process.env.KANBANCW_STAGE_PROPOSTA_ID,  nome: 'Proposta (Crediário)' },
+            'reprovado':        { id: process.env.KANBANCW_STAGE_REPROVADO_ID, nome: 'Reprovado (Crediário)' }
         };
-        const selectedStageId = stageIds[stage] || stageIds['topo'];
 
-        if (selectedStageId) {
-            await axios.patch(
-                `${KANBANCW_URL}/api/kanban/${conversationId}/move`,
-                { targetColumn: selectedStageId },
-                { headers: KANBANCW_HEADERS }
-            );
-            await axios.post(
-                `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/labels`,
-                { labels: [stage] },
-                { headers: { 'api_access_token': CHATWOOT_TOKEN } }
-            );
-            console.log(`[VENDAS] Conversa ${conversationId} classificada como ${stage} → stage ${selectedStageId}`);
+        const selected = stageIds[stage];
+
+        if (selected && selected.id) {
+            await moverCard(conversationId, accountId, selected.id, stage, selected.nome);
         } else {
-            console.log(`[AVISO] Conversa ${conversationId} classificada como ${stage}, mas o ID do Stage não foi configurado no .env.`);
+            console.log(`[AVISO] Conversa ${conversationId} classificada como ${stage}, mas o ID não existe ou retornou valor inesperado.`);
         }
 
         res.status(200).send({ success: true, funil: 'vendas', classification: stage });
