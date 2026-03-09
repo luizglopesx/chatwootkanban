@@ -43,6 +43,11 @@ const CREDIARIO_RULES = [
     }
 ];
 
+// Verifica se alguma mensagem do histórico bate com os padrões do crediário
+function isCrediarioConversation(messages) {
+    return messages.some(m => m.content && CREDIARIO_RULES.some(r => r.pattern.test(m.content)));
+}
+
 // Função auxiliar para mover card e adicionar label
 async function moverCard(conversationId, accountId, stageId, label, nome) {
     await axios.patch(
@@ -80,7 +85,7 @@ app.post('/webhook/chatwoot', async (req, res) => {
             return res.status(200).send('Ignorado: mensagem não corresponde a nenhuma regra do crediário.');
         }
 
-        // ─── FUNIL DE VENDAS: classificação com IA em conversation_status_changed ───
+        // ─── FUNIL DE VENDAS / CREDIÁRIO via IA: conversation_status_changed ───
         if (payload.event !== 'conversation_status_changed' || !['resolved', 'snoozed'].includes(payload.status)) {
             return res.status(200).send('Ignorado: evento não relevante para qualificação.');
         }
@@ -103,7 +108,60 @@ app.post('/webhook/chatwoot', async (req, res) => {
 
         if (!historyText) return res.status(200).send('Sem histórico válido.');
 
-        // Classificar o lead via AI Agent
+        // ─── Detecta se é conversa de Crediário ───
+        if (isCrediarioConversation(messages)) {
+            console.log(`[CREDIÁRIO IA] Conversa ${conversationId} identificada como crediário. Classificando...`);
+
+            const promptCrediario = `Você é um especialista em análise de crédito e vendas de colchões no crediário.
+Analise o histórico de conversa abaixo e classifique em qual etapa do funil de crediário este lead se encontra.
+
+## Definição das Etapas:
+**ANALISE** — Lead em processo de análise de crédito:
+- Enviou dados pessoais para análise
+- Está aguardando resultado da consulta de crédito
+- O sistema retornou [STATUS: success] (análise iniciada com sucesso)
+
+**PROPOSTA** — Lead com crédito em avaliação ou proposta gerada:
+- Foi solicitada fatura de energia elétrica
+- Recebeu uma proposta de financiamento
+- Está considerando as condições do crediário
+
+**REPROVADO** — Lead com crédito negado:
+- A análise de crédito foi realizada e não liberou ofertas
+- O sistema não aprovou o financiamento
+
+## Instrução:
+Retorne APENAS uma das palavras abaixo, sem explicação, sem pontuação extra:
+analise
+proposta
+reprovado`;
+
+            const completion = await openai.chat.completions.create({
+                model: "gpt-4o-mini",
+                messages: [
+                    { role: "system", content: promptCrediario },
+                    { role: "user", content: `Histórico:\n${historyText}` }
+                ],
+                temperature: 0.1
+            });
+
+            const stage = completion.choices[0].message.content.trim().toLowerCase();
+
+            const stageMap = {
+                'analise': { id: process.env.KANBANCW_STAGE_ANALISE_ID, label: 'analise-credito', nome: 'Análise de Crédito' },
+                'proposta': { id: process.env.KANBANCW_STAGE_PROPOSTA_ID, label: 'proposta-enviada', nome: 'Proposta Enviada' },
+                'reprovado': { id: process.env.KANBANCW_STAGE_REPROVADO_ID, label: 'reprovado', nome: 'Reprovado' }
+            };
+
+            const selected = stageMap[stage] || stageMap['analise'];
+
+            await moverCard(conversationId, accountId, selected.id, selected.label, selected.nome);
+            return res.status(200).send({ success: true, funil: 'crediario-ia', classification: stage });
+        }
+
+        // ─── FUNIL DE VENDAS: classificação com IA ───
+        console.log(`[VENDAS] Conversa ${conversationId} classificando com IA...`);
+
         const promptSystem = `Você é um especialista em funil de vendas de colchões e produtos de sono.
 Analise o histórico de conversa abaixo e classifique em qual etapa do funil de vendas este lead se encontra.
 
